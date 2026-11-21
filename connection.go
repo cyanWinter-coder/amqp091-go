@@ -196,8 +196,7 @@ type Connection struct {
 
 	rpc       chan message
 	writer    *writer
-	sends     chan time.Time     // timestamps of each frame sent
-	deadlines chan readDeadliner // heartbeater updates read deadlines
+	heartbeat *heartbeatState // complete-frame activity tracked for the heartbeater
 
 	allocator *allocator // id generator valid after openTune
 	channels  map[uint16]*Channel
@@ -241,10 +240,6 @@ type Connection struct {
 	lifeCycle    *lifeCycle // The current state of the connection.
 
 	recoveryCancels []chan struct{} // listeners for connection recovery cancellation
-}
-
-type readDeadliner interface {
-	SetReadDeadline(time.Time) error
 }
 
 // DefaultDial establishes a connection when config.Dial is not provided
@@ -445,10 +440,9 @@ func Open(conn io.ReadWriteCloser, config Config) (*Connection, error) {
 		channels:              make(map[uint16]*Channel),
 		topologyConfiguration: make(map[uint16]*TopologyConfiguration),
 		rpc:                   make(chan message),
-		sends:                 make(chan time.Time),
 		errors:                make(chan *Error, 1),
 		close:                 make(chan struct{}),
-		deadlines:             make(chan readDeadliner, 1),
+		heartbeat:             newHeartbeatState(),
 		// TODO: Connection has Config and also an atomic int for MaxFrameSize. Duplication to simplify.
 		Config:    config,
 		lifeCycle: newLifeCycle(),
@@ -745,6 +739,13 @@ func (c *Connection) IsClosed() bool {
 	return c.closed.Load()
 }
 
+// isClosing reports whether a connection close handshake has been initiated.
+func (c *Connection) isClosing() bool {
+	c.closeM.Lock()
+	defer c.closeM.Unlock()
+	return c.closeInit
+}
+
 // setDeadline is a wrapper to type assert Connection.conn and set an I/O
 // deadline in the underlying TCP connection socket, by calling
 // net.Conn.SetDeadline(). It returns an error, in case the type assertion fails,
@@ -773,13 +774,7 @@ func (c *Connection) send(f frame) error {
 			Reason: err.Error(),
 		})
 	} else {
-		// Broadcast we sent a frame, reducing heartbeats, only
-		// if there is something that can receive - like a non-reentrant
-		// call or if the heartbeater isn't running
-		select {
-		case c.sends <- time.Now():
-		default:
-		}
+		c.heartbeat.recordWrite()
 	}
 
 	return err
@@ -834,19 +829,13 @@ func (c *Connection) flush() (err error) {
 	if buf, ok := c.writer.w.(*bufio.Writer); ok {
 		err = buf.Flush()
 
-		// Moving send notifier to flush increases basicPublish for the small message
-		// case. As sendUnflushed + flush is used for the case of sending semantically
-		// related Frames (e.g. a Message like basicPublish) there is no real advantage
-		// to sending per Frame vice per "group of related Frames" and for the case of
-		// small messages time.Now() is (relatively) expensive.
+		// Recording the send at flush rather than per frame improves
+		// basicPublish throughput for the small message case. As
+		// sendUnflushed + flush is used for the case of sending semantically
+		// related Frames (e.g. a Message like basicPublish) there is no real
+		// advantage to recording per Frame vice per "group of related Frames".
 		if err == nil {
-			// Broadcast we sent a frame, reducing heartbeats, only
-			// if there is something that can receive - like a non-reentrant
-			// call or if the heartbeater isn't running
-			select {
-			case c.sends <- time.Now():
-			default:
-			}
+			c.heartbeat.recordWrite()
 		}
 	}
 
@@ -961,7 +950,7 @@ func (c *Connection) dispatch0(f frame) {
 			}
 		}
 	case *heartbeatFrame:
-		// kthx - all reads reset our deadline.  so we can drop this
+		// Already recorded as activity by the reader; nothing to dispatch.
 	default:
 		// lolwat - channel0 only responds to methods and heartbeats
 		// closeWith use call don't block reader
@@ -1032,7 +1021,6 @@ func (c *Connection) dispatchClosed(f frame) {
 func (c *Connection) reader(r io.Reader) {
 	buf := bufio.NewReader(r)
 	frames := &reader{r: buf, maxFrameSize: &c.maxFrameSize}
-	conn, haveDeadliner := r.(readDeadliner)
 
 	defer close(c.rpc)
 
@@ -1043,69 +1031,11 @@ func (c *Connection) reader(r io.Reader) {
 			return
 		}
 
+		// Every complete frame, heartbeat or otherwise, counts as peer
+		// activity for the heartbeater.
+		c.heartbeat.recordRead()
+
 		c.demux(frame)
-
-		if haveDeadliner {
-			select {
-			case c.deadlines <- conn:
-			default:
-				// On c.Close() c.heartbeater() might exit just before c.deadlines <- conn is called.
-				// Which results in this goroutine being stuck forever.
-			}
-		}
-	}
-}
-
-// Ensures that at least one frame is being sent at the tuned interval with a
-// jitter tolerance of 1s
-func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
-	const maxServerHeartbeatsInFlight = 3
-
-	var sendTicks <-chan time.Time
-	if interval > 0 {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		sendTicks = ticker.C
-	}
-
-	lastSent := time.Now()
-
-	for {
-		select {
-		case at, stillSending := <-c.sends:
-			// When actively sending, depend on sent frames to reset server timer
-			if stillSending {
-				lastSent = at
-			} else {
-				return
-			}
-
-		case at := <-sendTicks:
-			// When idle, fill the space with a heartbeat frame
-			if at.Sub(lastSent) > interval-time.Second {
-				if err := c.send(&heartbeatFrame{}); err != nil {
-					// send heartbeats even after close/closeOk so we
-					// tick until the connection starts erroring
-					return
-				}
-			}
-
-		case conn := <-c.deadlines:
-			// When reading, reset our side of the deadline, if we've negotiated one with
-			// a deadline that covers at least 2 server heartbeats
-			if interval > 0 {
-				if err := conn.SetReadDeadline(time.Now().Add(maxServerHeartbeatsInFlight * interval)); err != nil {
-					var opErr *net.OpError
-					if !errors.As(err, &opErr) {
-						Logger.Printf("error setting read deadline in heartbeater: %+v", err)
-						return
-					}
-				}
-			}
-
-		case <-done:
-			return
-		}
 	}
 }
 
@@ -1399,14 +1329,19 @@ func (c *Connection) openTune(config Config, auth Authentication) error {
 	// another write path is ever added.
 	c.maxFrameSize.Store(uint32(c.Config.FrameSize))
 
-	// Save this off for resetDeadline()
+	// The negotiated interval drives the heartbeater's send and timeout
+	// decisions.
 	c.Config.Heartbeat = time.Second * time.Duration(pick(
 		int(config.Heartbeat/time.Second),
 		int(tune.Heartbeat)))
+	if c.heartbeat == nil {
+		c.heartbeat = newHeartbeatState()
+	}
+	c.heartbeat.setInterval(c.Config.Heartbeat)
 
 	// "The client should start sending heartbeats after receiving a
 	// Connection.Tune method"
-	go c.heartbeater(c.Config.Heartbeat/2, c.close)
+	go c.heartbeater(c.close)
 
 	if err := c.send(&methodFrame{
 		ChannelId: 0,

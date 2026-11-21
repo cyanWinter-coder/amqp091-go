@@ -87,7 +87,7 @@ func TestBasicCancelDispatchAcknowledgesOnlyWhenServerAccepts(t *testing.T) {
 				}
 				t.Run(name, func(t *testing.T) {
 					var output bytes.Buffer
-					conn := &Connection{Properties: tc.properties, writer: &writer{w: &output}}
+					conn := &Connection{Properties: tc.properties, writer: &writer{w: &output}, heartbeat: newHeartbeatState()}
 					ch := newChannel(conn, 1)
 					t.Cleanup(func() { ch.consumers.close() })
 					const tag = "ctag"
