@@ -282,6 +282,7 @@ type DeferredConfirmation struct {
 
 	done chan struct{}
 	ack  bool
+	err  error
 }
 
 // Confirmation notifies the acknowledgment or negative acknowledgement of a

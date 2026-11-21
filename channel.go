@@ -1962,7 +1962,7 @@ func (ch *Channel) PublishWithDeferredConfirm(exchange, key string, mandatory, i
 		},
 	}); err != nil {
 		if ch.confirming.Load() {
-			ch.confirms.unpublish()
+			ch.confirms.unpublish(err)
 		}
 		return nil, err
 	}
@@ -2265,7 +2265,7 @@ func (ch *Channel) closeResources(err error) {
 		ch.cancels = nil
 
 		if ch.confirms != nil {
-			ch.confirms.Close()
+			ch.confirms.Close(err)
 		}
 
 		ch.noNotify = true

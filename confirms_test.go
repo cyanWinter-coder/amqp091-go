@@ -230,7 +230,7 @@ func TestDeferredConfirmationsClose(t *testing.T) {
 		result = !dc1.Wait() && !dc2.Wait() && !dc3.Wait()
 		wg.Done()
 	}()
-	dcs.Close()
+	dcs.Close(ErrClosed)
 	wg.Wait()
 	if !result {
 		t.Fatal("expected to receive false for nacked confirmations, received true")
@@ -328,5 +328,275 @@ func TestConfirmDispatchDropsNotificationOnFullListener(t *testing.T) {
 		}
 	case <-time.After(6 * time.Second):
 		t.Fatal("confirm blocked on full listener for more than 6 seconds")
+	}
+}
+
+func TestConfirmOneDropsStaleConfirmation(t *testing.T) {
+	var (
+		c = newConfirms()
+		l = make(chan Confirmation, 4)
+	)
+	c.Listen(l)
+
+	for i := 0; i < 3; i++ {
+		c.publish()
+	}
+
+	c.Multiple(Confirmation{2, true})
+
+	// Duplicates of already settled tags must be dropped, not parked.
+	c.One(Confirmation{1, true})
+	c.One(Confirmation{2, false})
+
+	if got := len(c.sequencer); got != 0 {
+		t.Fatalf("expected no stale confirmations in the sequencer, got %d", got)
+	}
+
+	c.One(Confirmation{3, true})
+
+	for i := uint64(1); i <= 3; i++ {
+		if want, got := (Confirmation{i, true}), <-l; want != got {
+			t.Fatalf("expected exactly one confirmation per tag, want: %+v, got: %+v", want, got)
+		}
+	}
+
+	select {
+	case confirm := <-l:
+		t.Fatalf("expected no duplicate notification for a settled tag, got: %+v", confirm)
+	default:
+	}
+}
+
+func TestConfirmOutOfOrderDoesNotSettleOthers(t *testing.T) {
+	c := newConfirms()
+
+	dcs := make([]*DeferredConfirmation, 4)
+	for i := range dcs {
+		dcs[i] = c.publish()
+	}
+
+	// A single out-of-order confirm must leave smaller and larger tags pending.
+	c.One(Confirmation{3, true})
+
+	for _, i := range []int{0, 1, 3} {
+		select {
+		case <-dcs[i].Done():
+			t.Fatalf("expected tag %d to remain pending after an out-of-order confirm of tag 3", i+1)
+		default:
+		}
+	}
+	if !dcs[2].Acked() {
+		t.Fatal("expected tag 3 to be acknowledged")
+	}
+
+	// Confirming tag 1 must not flush the buffered tag 3 past the pending tag 2.
+	c.One(Confirmation{1, true})
+	if !dcs[0].Acked() {
+		t.Fatal("expected tag 1 to be acknowledged")
+	}
+	select {
+	case <-dcs[1].Done():
+		t.Fatal("expected tag 2 to remain pending")
+	default:
+	}
+
+	c.One(Confirmation{2, true})
+	for _, i := range []int{0, 1, 2} {
+		if !dcs[i].Acked() {
+			t.Fatalf("expected tag %d to be acknowledged after the gap was filled", i+1)
+		}
+	}
+	select {
+	case <-dcs[3].Done():
+		t.Fatal("expected tag 4 to remain pending")
+	default:
+	}
+
+	c.One(Confirmation{4, true})
+	if !dcs[3].Acked() {
+		t.Fatal("expected tag 4 to be acknowledged")
+	}
+}
+
+func TestConfirmMultipleSettlesOnlyCoveredRange(t *testing.T) {
+	c := newConfirms()
+
+	dcs := make([]*DeferredConfirmation, 4)
+	for i := range dcs {
+		dcs[i] = c.publish()
+	}
+
+	c.Multiple(Confirmation{2, false})
+
+	for _, i := range []int{0, 1} {
+		select {
+		case <-dcs[i].Done():
+		default:
+			t.Fatalf("expected tag %d to be settled by the multiple confirm", i+1)
+		}
+		if dcs[i].Acked() {
+			t.Fatalf("expected tag %d to be nacked", i+1)
+		}
+		if err := dcs[i].Err(); err != nil {
+			t.Fatalf("expected no error for a broker nack of tag %d, got: %v", i+1, err)
+		}
+	}
+	for _, i := range []int{2, 3} {
+		select {
+		case <-dcs[i].Done():
+			t.Fatalf("expected tag %d to remain pending outside the multiple confirm range", i+1)
+		default:
+		}
+	}
+}
+
+func TestConfirmMultipleBeyondPublishedIsClamped(t *testing.T) {
+	var (
+		c = newConfirms()
+		l = make(chan Confirmation, 3)
+	)
+	c.Listen(l)
+
+	c.publish()
+	c.publish()
+
+	// A batch confirm covering tags never published must not advance the
+	// expecting tag past them.
+	c.Multiple(Confirmation{5, true})
+
+	dc := c.publish()
+	c.One(Confirmation{3, true})
+
+	for i := uint64(1); i <= 3; i++ {
+		if want, got := (Confirmation{i, true}), <-l; want != got {
+			t.Fatalf("expected confirmations in sequence, want: %+v, got: %+v", want, got)
+		}
+	}
+	if !dc.Acked() {
+		t.Fatal("expected the tag published after the clamped multiple confirm to be acknowledged")
+	}
+}
+
+func TestConfirmsCloseWakesAllWaitersWithReason(t *testing.T) {
+	c := newConfirms()
+
+	dcs := make([]*DeferredConfirmation, 3)
+	for i := range dcs {
+		dcs[i] = c.publish()
+	}
+	c.One(Confirmation{2, true}) // park an out-of-order confirm in the sequencer
+
+	closeErr := &Error{Code: ChannelError, Reason: "test close"}
+	if err := c.Close(closeErr); err != nil {
+		t.Fatalf("expected no error from Close, got: %v", err)
+	}
+
+	for i, dc := range dcs {
+		select {
+		case <-dc.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("expected waiter for tag %d to be woken on close", i+1)
+		}
+	}
+
+	// Tag 2 was settled by its own confirm before the close.
+	if !dcs[1].Acked() {
+		t.Fatal("expected tag 2 to remain acknowledged from its pre-close confirm")
+	}
+	if err := dcs[1].Err(); err != nil {
+		t.Fatalf("expected no error for the pre-close confirmed tag 2, got: %v", err)
+	}
+
+	for _, i := range []int{0, 2} {
+		if dcs[i].Acked() {
+			t.Fatalf("expected tag %d to be settled as not acknowledged on close", i+1)
+		}
+		if got := dcs[i].Err(); got != closeErr {
+			t.Fatalf("expected the close reason to be preserved for tag %d, want: %v, got: %v", i+1, closeErr, got)
+		}
+	}
+
+	if got := len(c.sequencer); got != 0 {
+		t.Fatalf("expected the sequencer to be discarded on close, got %d entries", got)
+	}
+	if got := len(c.deferredConfirmations.confirmations); got != 0 {
+		t.Fatalf("expected no pending deferred confirmations after close, got %d", got)
+	}
+}
+
+func TestConfirmsCloseWithoutErrorUsesErrClosed(t *testing.T) {
+	c := newConfirms()
+	dc := c.publish()
+
+	if err := c.Close(nil); err != nil {
+		t.Fatalf("expected no error from Close, got: %v", err)
+	}
+
+	if got := dc.Err(); got != ErrClosed {
+		t.Fatalf("expected ErrClosed for a graceful close, got: %v", got)
+	}
+}
+
+func TestDeferredConfirmationTerminalStates(t *testing.T) {
+	t.Run("nack", func(t *testing.T) {
+		dcs := newDeferredConfirmations()
+		dc := dcs.Add(1)
+		dcs.Confirm(Confirmation{1, false})
+
+		if dc.Wait() {
+			t.Fatal("expected Wait to return false for a nacked confirmation")
+		}
+		if err := dc.Err(); err != nil {
+			t.Fatalf("expected no error for a broker nack, got: %v", err)
+		}
+	})
+
+	t.Run("publish failure", func(t *testing.T) {
+		c := newConfirms()
+		dc := c.publish()
+
+		sendErr := &Error{Code: ChannelError, Reason: "send failed"}
+		c.unpublish(sendErr)
+
+		if dc.Wait() {
+			t.Fatal("expected Wait to return false for a failed publish")
+		}
+		if got := dc.Err(); got != sendErr {
+			t.Fatalf("expected the publish error as the terminal state, want: %v, got: %v", sendErr, got)
+		}
+	})
+
+	t.Run("connection close", func(t *testing.T) {
+		c := newConfirms()
+		dc := c.publish()
+		c.reset()
+
+		if dc.Wait() {
+			t.Fatal("expected Wait to return false for a confirmation dropped by recovery")
+		}
+		if got := dc.Err(); got != ErrClosed {
+			t.Fatalf("expected ErrClosed for a confirmation dropped by recovery, got: %v", got)
+		}
+	})
+}
+
+func TestConfirmsSettledTagsAreForgotten(t *testing.T) {
+	c := newConfirms()
+
+	const count = 1000
+	for i := 0; i < count; i++ {
+		c.publish()
+	}
+	// Confirm out of order so every tag passes through the sequencer.
+	for i := count; i > 1; i-- {
+		c.One(Confirmation{uint64(i), true})
+	}
+	c.One(Confirmation{1, true})
+
+	if got := len(c.sequencer); got != 0 {
+		t.Fatalf("expected the sequencer to be empty after settling, got %d entries", got)
+	}
+	if got := len(c.deferredConfirmations.confirmations); got != 0 {
+		t.Fatalf("expected no pending deferred confirmations after settling, got %d", got)
 	}
 }

@@ -47,12 +47,13 @@ func (c *confirms) publish() *DeferredConfirmation {
 	return c.deferredConfirmations.Add(c.published)
 }
 
-// unpublish decrements the publishing counter and removes the
-// DeferredConfirmation. It must be called immediately after a publish fails.
-func (c *confirms) unpublish() {
+// unpublish decrements the publishing counter and settles the
+// DeferredConfirmation with the publish error. It must be called immediately
+// after a publish fails.
+func (c *confirms) unpublish(err error) {
 	c.publishedMut.Lock()
 	defer c.publishedMut.Unlock()
-	c.deferredConfirmations.remove(c.published)
+	c.deferredConfirmations.remove(c.published, err)
 	c.published--
 }
 
@@ -83,6 +84,13 @@ func (c *confirms) One(confirmed Confirmation) {
 	c.m.Lock()
 	defer c.m.Unlock()
 
+	if confirmed.DeliveryTag < c.expecting {
+		// The tag was already settled by an earlier (multiple) confirmation.
+		// Drop the duplicate instead of parking it in the sequencer, where it
+		// could never be resequenced and would leak.
+		return
+	}
+
 	c.deferredConfirmations.Confirm(confirmed)
 
 	if c.expecting == confirmed.DeliveryTag {
@@ -100,24 +108,33 @@ func (c *confirms) Multiple(confirmed Confirmation) {
 
 	c.deferredConfirmations.ConfirmMultiple(confirmed)
 
-	for c.expecting <= confirmed.DeliveryTag {
+	// Settle only the published tags covered by this batch. A tag beyond
+	// published must not advance expecting, or later confirmations would be
+	// dropped as stale.
+	c.publishedMut.Lock()
+	for c.expecting <= confirmed.DeliveryTag && c.expecting <= c.published {
 		c.confirm(Confirmation{c.expecting, confirmed.Ack})
 	}
+	c.publishedMut.Unlock()
 	c.resequence()
 }
 
-// Cleans up the confirms struct and its dependencies.
-// Closes all listeners, discarding any out of sequence confirmations
-func (c *confirms) Close() error {
+// Close settles every pending DeferredConfirmation with err as the reason,
+// closes all listeners, and discards any out of sequence confirmations.
+func (c *confirms) Close(err error) error {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	c.deferredConfirmations.Close()
+	if err == nil {
+		err = ErrClosed
+	}
+	c.deferredConfirmations.Close(err)
 
 	for _, l := range c.listeners {
 		close(l)
 	}
 	c.listeners = nil
+	c.sequencer = map[uint64]Confirmation{}
 	return nil
 }
 
@@ -132,7 +149,7 @@ func (c *confirms) reset() {
 
 	c.published = 0
 	c.expecting = 1
-	c.deferredConfirmations.Close()
+	c.deferredConfirmations.Close(ErrClosed)
 	c.sequencer = map[uint64]Confirmation{}
 }
 
@@ -157,15 +174,15 @@ func (d *deferredConfirmations) Add(tag uint64) *DeferredConfirmation {
 	return dc
 }
 
-// remove is only used to drop a tag whose publish failed
-func (d *deferredConfirmations) remove(tag uint64) {
+// remove settles the tag whose publish failed with the publish error
+func (d *deferredConfirmations) remove(tag uint64, err error) {
 	d.m.Lock()
 	defer d.m.Unlock()
 	dc, found := d.confirmations[tag]
 	if !found {
 		return
 	}
-	close(dc.done)
+	dc.settle(false, err)
 	delete(d.confirmations, tag)
 }
 
@@ -179,7 +196,7 @@ func (d *deferredConfirmations) Confirm(confirmation Confirmation) {
 		// been published, but a test causes this to happen.
 		return
 	}
-	dc.setAck(confirmation.Ack)
+	dc.settle(confirmation.Ack, nil)
 	delete(d.confirmations, confirmation.DeliveryTag)
 }
 
@@ -189,27 +206,29 @@ func (d *deferredConfirmations) ConfirmMultiple(confirmation Confirmation) {
 
 	for k, v := range d.confirmations {
 		if k <= confirmation.DeliveryTag {
-			v.setAck(confirmation.Ack)
+			v.settle(confirmation.Ack, nil)
 			delete(d.confirmations, k)
 		}
 	}
 }
 
-// Close nacks all pending DeferredConfirmations being blocked by dc.Wait().
-func (d *deferredConfirmations) Close() {
+// Close settles all pending DeferredConfirmations as not acknowledged with
+// err as the reason, unblocking any dc.Wait().
+func (d *deferredConfirmations) Close(err error) {
 	d.m.Lock()
 	defer d.m.Unlock()
 
 	for k, v := range d.confirmations {
-		v.setAck(false)
+		v.settle(false, err)
 		delete(d.confirmations, k)
 	}
 }
 
-// setAck sets the acknowledgement status of the confirmation. Note that it must
-// not be called more than once.
-func (d *DeferredConfirmation) setAck(ack bool) {
+// settle resolves the confirmation. Each tag is removed from the pending map
+// as it is settled, so a tag can never be settled twice.
+func (d *DeferredConfirmation) settle(ack bool, err error) {
 	d.ack = ack
+	d.err = err
 	close(d.done)
 }
 
@@ -229,6 +248,20 @@ func (d *DeferredConfirmation) Acked() bool {
 		return false
 	}
 	return d.ack
+}
+
+// Err returns why the confirmation was settled without a broker response: the
+// publish error when the publishing could not be sent, or the close error when
+// the channel or connection closed before the broker confirmed. It returns nil
+// while the confirmation is pending and once the broker has acknowledged or
+// nacked the publishing; use Acked to tell those two apart.
+func (d *DeferredConfirmation) Err() error {
+	select {
+	case <-d.done:
+	default:
+		return nil
+	}
+	return d.err
 }
 
 // Wait blocks until the publisher confirmation. It returns true if the server

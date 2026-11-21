@@ -77,7 +77,7 @@ Body can span multiple `frameBody` frames; `Channel` accumulates them before dis
 
 ### Publisher confirms (`confirms.go`)
 
-`Channel.Confirm(noWait)` enables confirm mode. Each subsequent publish is assigned a monotonically increasing delivery tag. The broker acknowledges with `basic.ack` / `basic.nack` frames, which may arrive out of order. `confirms.resequence()` buffers out-of-order acks and delivers them in order to all listeners. `DeferredConfirmation` provides a future-style API (`Wait`, `WaitContext`, `Acked`).
+`Channel.Confirm(noWait)` enables confirm mode. Each subsequent publish is assigned a monotonically increasing delivery tag. The broker acknowledges with `basic.ack` / `basic.nack` frames, which may arrive out of order. `confirms.resequence()` buffers out-of-order acks and delivers them in order to all listeners. Confirmations for already-settled tags are dropped, and batch (`multiple`) confirms settle only published tags up to their delivery tag. `DeferredConfirmation` provides a future-style API (`Wait`, `WaitContext`, `Acked`, `Err`); `Err` distinguishes the terminal states: nil for a broker ack/nack, the publish error when the publish could not be sent, and the close error when the channel or connection closed first.
 
 ### Consumer dispatch (`consumers.go`)
 
