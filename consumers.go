@@ -10,11 +10,18 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var consumerSeq atomic.Uint64
 
 const consumerTagLengthMax = 0xFF // see writeShortstr
+
+// consumerDrainTimeout bounds how long a consumer's buffer goroutine keeps
+// flushing queued deliveries to the application channel once the channel has
+// been closed. Deliveries the application does not receive within this
+// window are dropped and reported. It is a variable so tests can shorten it.
+var consumerDrainTimeout = 2 * time.Second
 
 func uniqueConsumerTag() string {
 	return commandNameBasedUniqueConsumerTag(os.Args[0])
@@ -46,7 +53,40 @@ type consumerConfig struct {
 	Args      Table
 }
 
-type consumerBuffers map[string]chan *Delivery
+// consumerState identifies the lifecycle state of a single consumer
+// registration. The state moves monotonically from active to draining, and
+// the transition happens exactly once, however it is reached:
+// Channel.Cancel, a server-sent basic.cancel, a tag conflict on
+// re-registration, or channel teardown. Removal from the consumers registry
+// is the terminal state.
+type consumerState int
+
+const (
+	// consumerActive accepts new deliveries from the reader goroutine.
+	consumerActive consumerState = iota
+	// consumerDraining rejects new deliveries. Deliveries already accepted
+	// are flushed to the application channel before it is closed.
+	consumerDraining
+)
+
+// consumer tracks one consumer tag registration.
+type consumer struct {
+	tag   string
+	in    chan *Delivery
+	state consumerState // guarded by consumers.Mutex
+}
+
+// stopAccepting performs the active -> draining transition, exactly once.
+// The caller must hold consumers.Mutex. It reports whether this call
+// performed the transition.
+func (c *consumer) stopAccepting() bool {
+	if c.state != consumerActive {
+		return false
+	}
+	c.state = consumerDraining
+	close(c.in)
+	return true
+}
 
 // consumerConfigs maps unique consumer tags to their respective consumerConfig parameters,
 // facilitating the automatic re-registration of all consumers during channel recovery.
@@ -59,32 +99,43 @@ type consumers struct {
 	closed         chan struct{} // signal buffer
 
 	sync.Mutex // protects below
-	chans      consumerBuffers
+	chans      map[string]*consumer
 	configs    consumerConfigs
 }
 
 func makeConsumers() *consumers {
 	return &consumers{
 		closed:  make(chan struct{}),
-		chans:   make(consumerBuffers),
+		chans:   make(map[string]*consumer),
 		configs: make(consumerConfigs),
 	}
 }
 
-func (subs *consumers) buffer(in chan *Delivery, out chan Delivery) {
-	defer close(out)
-	defer subs.Done()
+func (subs *consumers) buffer(c *consumer, out chan Delivery) {
+	defer func() {
+		close(out)
+		// Remove the registration unless a newer consumer has already
+		// replaced it under the same tag.
+		subs.Lock()
+		if subs.chans[c.tag] == c {
+			delete(subs.chans, c.tag)
+		}
+		subs.Unlock()
+		subs.Done()
+	}()
 
-	inflight := in
+	inflight := c.in
 	var queue []*Delivery
 
-	for delivery := range in {
+	for delivery := range c.in {
 		queue = append(queue, delivery)
 
 		for len(queue) > 0 {
 			select {
 			case <-subs.closed:
-				// closed before drained, drop in-flight
+				// Closed before drained: flush what remains within a
+				// bounded window, then drop and report the rest.
+				drainQueue(c.tag, queue, out)
 				return
 
 			case delivery, consuming := <-inflight:
@@ -128,36 +179,69 @@ func (subs *consumers) buffer(in chan *Delivery, out chan Delivery) {
 	}
 }
 
-// On key conflict, close the previous channel.
-func (subs *consumers) add(tag string, consumer chan Delivery, config consumerConfig) {
+// drainQueue flushes queued deliveries to out after the channel has been
+// closed. Deliveries the application does not receive within
+// consumerDrainTimeout are dropped and reported; they remain unacknowledged,
+// so the broker requeues them when the channel closes.
+func drainQueue(tag string, queue []*Delivery, out chan Delivery) {
+	if len(queue) == 0 {
+		return
+	}
+	timer := time.NewTimer(consumerDrainTimeout)
+	defer timer.Stop()
+	for len(queue) > 0 {
+		select {
+		case out <- *queue[0]:
+			queue[0] = nil
+			queue = queue[1:]
+		case <-timer.C:
+			Logger.Printf("consumer %s: dropping %d queued deliveries on channel close", tag, len(queue))
+			return
+		}
+	}
+}
+
+// On key conflict, the previous registration is cancelled: it stops
+// accepting new deliveries and its buffer goroutine drains and terminates on
+// its own.
+func (subs *consumers) add(tag string, out chan Delivery, config consumerConfig) {
 	subs.Lock()
 	defer subs.Unlock()
 
 	if prev, found := subs.chans[tag]; found {
-		close(prev)
+		prev.stopAccepting()
+		delete(subs.chans, tag)
 	}
 
-	in := make(chan *Delivery)
-	subs.chans[tag] = in
+	c := &consumer{
+		tag:   tag,
+		in:    make(chan *Delivery),
+		state: consumerActive,
+	}
+	subs.chans[tag] = c
 	subs.configs[tag] = config
 
 	subs.Add(1)
-	go subs.buffer(in, consumer)
+	go subs.buffer(c, out)
 }
 
+// cancel transitions the consumer identified by tag from active to draining:
+// no new deliveries are accepted, and deliveries already accepted are
+// flushed to the application channel before it is closed. It reports whether
+// this call performed the transition, so a repeated cancel, or one racing
+// with channel teardown, returns false and leaves the terminal state
+// untouched.
 func (subs *consumers) cancel(tag string) (found bool) {
 	subs.Lock()
 	defer subs.Unlock()
 
-	ch, found := subs.chans[tag]
-
-	if found {
-		delete(subs.chans, tag)
-		delete(subs.configs, tag)
-		close(ch)
+	c, found := subs.chans[tag]
+	if !found {
+		return false
 	}
 
-	return found
+	delete(subs.configs, tag)
+	return c.stopAccepting()
 }
 
 // queueForTag returns the queue name for the given consumer tag without removing the consumer.
@@ -200,16 +284,20 @@ func (subs *consumers) cancelByQueue(queue string) {
 
 func (subs *consumers) close() {
 	subs.Lock()
-	defer subs.Unlock()
 
 	close(subs.closed)
 
-	for tag, ch := range subs.chans {
+	for tag, c := range subs.chans {
 		delete(subs.chans, tag)
 		delete(subs.configs, tag)
-		close(ch)
+		c.stopAccepting()
 	}
 
+	subs.Unlock()
+
+	// Wait for the buffer goroutines to drain; each is bounded by
+	// consumerDrainTimeout, so a slow consumer cannot block teardown
+	// indefinitely.
 	subs.Wait()
 }
 
@@ -217,14 +305,19 @@ func (subs *consumers) close() {
 // If unbuffered channels are used for Consume this method
 // could block all deliveries until the consumer
 // receives on the other end of the channel.
+//
+// It returns false — dropping the delivery — when the consumer is unknown or
+// no longer active: a consumer that has begun cancellation does not accept
+// new deliveries.
 func (subs *consumers) send(tag string, msg *Delivery) bool {
 	subs.Lock()
 	defer subs.Unlock()
 
-	buffer, found := subs.chans[tag]
-	if found {
-		buffer <- msg
+	c, found := subs.chans[tag]
+	if !found || c.state != consumerActive {
+		return false
 	}
 
-	return found
+	c.in <- msg
+	return true
 }

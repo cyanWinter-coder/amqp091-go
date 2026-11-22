@@ -386,3 +386,28 @@ func TestReconnectChannelAbortsWhenCloseWonTheRace(t *testing.T) {
 		t.Fatal("reconnectChannel() did not return within 2s — it did not abort on closeInit and is stuck in its retry loop")
 	}
 }
+
+func TestChannelResetStateDiscardsPartialDelivery(t *testing.T) {
+	t.Parallel()
+
+	ch := newChannel(&Connection{}, 1)
+
+	// Simulate a delivery interrupted mid-assembly on the dead session.
+	ch.transition((*Channel).recvContent)
+	ch.header = &headerFrame{Size: 10}
+	ch.body = []byte("half")
+	ch.message = &basicDeliver{}
+
+	ch.resetState()
+
+	if ch.message != nil || ch.header != nil || ch.body != nil {
+		t.Fatal("expected partial delivery state to be discarded")
+	}
+
+	// A stray body frame on the new session is dropped by recvMethod instead
+	// of being appended to the stale partial delivery.
+	ch.recv(ch, &bodyFrame{Body: []byte("rest")})
+	if ch.body != nil {
+		t.Fatal("expected the stray body frame to be dropped")
+	}
+}

@@ -546,9 +546,13 @@ func (ch *Channel) dispatch(msg message) {
 		}
 
 	case *basicDeliver:
-		ch.consumers.send(m.ConsumerTag, newDelivery(ch, m))
-		// TODO log failed consumer and close channel, this can happen when
-		// deliveries are in flight and a no-wait cancel has happened
+		if !ch.consumers.send(m.ConsumerTag, newDelivery(ch, m)) {
+			// The consumer was cancelled (or never registered) while this
+			// delivery was in flight, e.g. after a no-wait cancel. Drop it
+			// explicitly: it stays unacknowledged, so the broker requeues
+			// it when this channel closes.
+			Logger.Printf("dropping delivery for cancelled or unknown consumer %q on channel %d", m.ConsumerTag, ch.id)
+		}
 
 	default:
 		ch.m.Lock()
@@ -1421,9 +1425,10 @@ or server.
 Inflight messages, limited by Channel.Qos will be buffered until received from
 the returned chan.
 
-When the Channel or Connection is closed, all buffered and inflight messages will
-be dropped. RabbitMQ will requeue messages not acknowledged. In other words, dropped
-messages in this way won't be lost.
+When the Channel or Connection is closed, buffered deliveries are flushed to
+the returned chan for a bounded time (2 seconds) before being dropped and
+reported. RabbitMQ will requeue messages not acknowledged. In other words,
+dropped messages in this way won't be lost.
 
 When the consumer tag is cancelled, all inflight messages will be delivered until
 the returned chan is closed.
@@ -1531,9 +1536,10 @@ or server.
 Inflight messages, limited by Channel.Qos will be buffered until received from
 the returned chan.
 
-When the Channel or Connection is closed, all buffered and inflight messages will
-be dropped. RabbitMQ will requeue messages not acknowledged. In other words, dropped
-messages in this way won't be lost.
+When the Channel or Connection is closed, buffered deliveries are flushed to
+the returned chan for a bounded time (2 seconds) before being dropped and
+reported. RabbitMQ will requeue messages not acknowledged. In other words,
+dropped messages in this way won't be lost.
 */
 func (ch *Channel) ConsumeWithContext(ctx context.Context, queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args Table) (<-chan Delivery, error) {
 	// When we return from ch.call, there may be a delivery already for the
@@ -2533,6 +2539,14 @@ func (ch *Channel) resetState() {
 	ch.errors = make(chan *Error, 1)
 	ch.close = make(chan struct{})
 	ch.rpc = make(chan message)
+
+	// Discard any partially assembled delivery from the dead session, so
+	// its remaining frames cannot leak into the first message of the new
+	// session.
+	ch.recv = (*Channel).recvMethod
+	ch.message = nil
+	ch.header = nil
+	ch.body = nil
 
 	if ch.confirms != nil {
 		ch.confirms.reset()
