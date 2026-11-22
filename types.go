@@ -280,8 +280,9 @@ type Blocking struct {
 type DeferredConfirmation struct {
 	DeliveryTag uint64
 
-	done chan struct{}
-	ack  bool
+	done   chan struct{}
+	ack    bool
+	status ConfirmationStatus
 }
 
 // Confirmation notifies the acknowledgment or negative acknowledgement of a
