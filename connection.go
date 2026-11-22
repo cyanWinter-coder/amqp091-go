@@ -199,6 +199,18 @@ type Connection struct {
 	sends     chan time.Time     // timestamps of each frame sent
 	deadlines chan readDeadliner // heartbeater updates read deadlines
 
+	// lastFrameRead and lastFrameWrite commit only when a whole frame has
+	// crossed the wire: the reader updates its timestamp after the frame-end
+	// byte of a complete frame, the writer after a frame (or a flushed group
+	// of frames) has been flushed. Half-read or buffered-but-unflushed bytes
+	// never count as activity. Zero means no complete frame yet.
+	lastFrameRead  atomic.Int64 // unix nano of the last complete frame read
+	lastFrameWrite atomic.Int64 // unix nano of the last complete frame written
+
+	// heartbeatM serializes discretionary heartbeat writes so that at most
+	// one heartbeat frame ever waits behind sendM at a time.
+	heartbeatM sync.Mutex
+
 	allocator *allocator // id generator valid after openTune
 	channels  map[uint16]*Channel
 
@@ -745,6 +757,44 @@ func (c *Connection) IsClosed() bool {
 	return c.closed.Load()
 }
 
+// LastFrameRead returns the time at which the most recent complete frame was
+// read from the connection. It advances only once a full frame, including its
+// frame-end byte, has been parsed; partial frame bytes do not affect it. The
+// zero time means no complete frame has been read yet.
+func (c *Connection) LastFrameRead() time.Time {
+	return unixNanoTime(c.lastFrameRead.Load())
+}
+
+// LastFrameWrite returns the time at which the most recent complete frame was
+// written to the connection. It advances only after a frame write has been
+// flushed to the transport; frames still buffered in an unflushed writer do
+// not affect it. The zero time means no complete frame has been written yet.
+func (c *Connection) LastFrameWrite() time.Time {
+	return unixNanoTime(c.lastFrameWrite.Load())
+}
+
+func unixNanoTime(nanos int64) time.Time {
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
+}
+
+// noteFrameRead marks a complete frame as read at the frame boundary.
+func (c *Connection) noteFrameRead() {
+	c.lastFrameRead.Store(time.Now().UnixNano())
+}
+
+// noteFrameWrite marks a complete frame as written and keeps the heartbeater's
+// legacy sends channel wake-up in a single place.
+func (c *Connection) noteFrameWrite() {
+	c.lastFrameWrite.Store(time.Now().UnixNano())
+	select {
+	case c.sends <- time.Now():
+	default:
+	}
+}
+
 // setDeadline is a wrapper to type assert Connection.conn and set an I/O
 // deadline in the underlying TCP connection socket, by calling
 // net.Conn.SetDeadline(). It returns an error, in case the type assertion fails,
@@ -776,10 +826,7 @@ func (c *Connection) send(f frame) error {
 		// Broadcast we sent a frame, reducing heartbeats, only
 		// if there is something that can receive - like a non-reentrant
 		// call or if the heartbeater isn't running
-		select {
-		case c.sends <- time.Now():
-		default:
-		}
+		c.noteFrameWrite()
 	}
 
 	return err
@@ -840,13 +887,9 @@ func (c *Connection) flush() (err error) {
 		// to sending per Frame vice per "group of related Frames" and for the case of
 		// small messages time.Now() is (relatively) expensive.
 		if err == nil {
-			// Broadcast we sent a frame, reducing heartbeats, only
-			// if there is something that can receive - like a non-reentrant
-			// call or if the heartbeater isn't running
-			select {
-			case c.sends <- time.Now():
-			default:
-			}
+			// The flush is the frame-level commit boundary for unflushed writes:
+			// only now have the complete frames crossed the wire.
+			c.noteFrameWrite()
 		}
 	}
 
@@ -1030,7 +1073,14 @@ func (c *Connection) dispatchClosed(f frame) {
 // will demux the streams and dispatch to one of the opened channels or
 // handle on channel 0 (the connection channel).
 func (c *Connection) reader(r io.Reader) {
-	buf := bufio.NewReader(r)
+	c.readerWithBuffer(r, defaultReaderBufferSize)
+}
+
+// defaultReaderBufferSize matches bufio.Reader's default buffer.
+const defaultReaderBufferSize = 4096
+
+func (c *Connection) readerWithBuffer(r io.Reader, bufferSize int) {
+	buf := bufio.NewReaderSize(r, bufferSize)
 	frames := &reader{r: buf, maxFrameSize: &c.maxFrameSize}
 	conn, haveDeadliner := r.(readDeadliner)
 
@@ -1043,6 +1093,10 @@ func (c *Connection) reader(r io.Reader) {
 			return
 		}
 
+		// ReadFrame returns only after consuming the frame-end byte, so this
+		// commits at the full-frame boundary rather than mid-frame.
+		c.noteFrameRead()
+
 		c.demux(frame)
 
 		if haveDeadliner {
@@ -1054,6 +1108,46 @@ func (c *Connection) reader(r io.Reader) {
 			}
 		}
 	}
+}
+
+// isClosing reports whether a graceful or error close has been initiated.
+// It is the heartbeater's gate: once a close handshake starts, discretionary
+// heartbeat writes must stop so they cannot race the close frame or trigger a
+// competing shutdown with a different reason.
+func (c *Connection) isClosing() bool {
+	c.closeM.Lock()
+	defer c.closeM.Unlock()
+	return c.closeInit
+}
+
+// heartbeatDue decides whether the negotiated interval has elapsed without a
+// complete frame leaving the client. Buffered or half-written bytes do not
+// count, so a write stalled behind sendM keeps the heartbeat due rather than
+// being mistaken for activity.
+func heartbeatDue(lastSent, now time.Time, interval time.Duration) bool {
+	return now.Sub(lastSent) > interval-time.Second
+}
+
+// shouldLogHeartbeatBlocked rate-limits congestion reporting to once per
+// interval so a permanently blocked writer cannot flood the log.
+func shouldLogHeartbeatBlocked(lastLog *time.Time, now time.Time, interval time.Duration) bool {
+	if !lastLog.IsZero() && now.Sub(*lastLog) < interval {
+		return false
+	}
+	*lastLog = now
+	return true
+}
+
+// logHeartbeatBlocked reports a heartbeat that could not be sent because the
+// connection writer was occupied. A blocked heartbeat never shuts the
+// connection down on its own: only an actual write error does, keeping send
+// congestion distinct from a connection failure.
+func (c *Connection) logHeartbeatBlocked(waited time.Duration, interval time.Duration, lastLog *time.Time, now time.Time) {
+	if !shouldLogHeartbeatBlocked(lastLog, now, interval) {
+		return
+	}
+	Logger.Printf("heartbeat blocked for %s behind an in-flight write (interval %s); connection write is congested but not failed",
+		waited.Round(time.Millisecond), interval)
 }
 
 // Ensures that at least one frame is being sent at the tuned interval with a
@@ -1069,6 +1163,10 @@ func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
 	}
 
 	lastSent := time.Now()
+	// blockedSince marks the tick at which the current heartbeat first failed
+	// to reach the writer; zero means no heartbeat is queued behind sendM.
+	blockedSince := time.Time{}
+	var lastBlockLog time.Time
 
 	for {
 		select {
@@ -1081,14 +1179,57 @@ func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
 			}
 
 		case at := <-sendTicks:
-			// When idle, fill the space with a heartbeat frame
-			if at.Sub(lastSent) > interval-time.Second {
-				if err := c.send(&heartbeatFrame{}); err != nil {
-					// send heartbeats even after close/closeOk so we
-					// tick until the connection starts erroring
+			// interval == 0 keeps the legacy behavior entirely: no ticker was
+			// created, so this case can never fire and no heartbeat is sent.
+			if !heartbeatDue(lastSent, at, interval) {
+				blockedSince = time.Time{}
+				break
+			}
+
+			// Stop discretionary heartbeats as soon as a close handshake has
+			// started. The close path owns the writer and the shutdown reason
+			// from here on; a heartbeat losing a write race must not replace it.
+			if c.isClosing() {
+				return
+			}
+
+			// Single coordinator: heartbeatM guarantees only one goroutine can
+			// attempt a heartbeat write, and tryLock on sendM guarantees no
+			// heartbeat ever queues behind a stalled business frame. A blocked
+			// tick is observed diagnostically instead of piling frames up.
+			c.heartbeatM.Lock()
+			if !c.sendM.TryLock() {
+				waited := interval
+				if !blockedSince.IsZero() {
+					waited = at.Sub(blockedSince)
+				} else {
+					blockedSince = at
+				}
+				c.logHeartbeatBlocked(waited, interval, &lastBlockLog, at)
+				c.heartbeatM.Unlock()
+				break
+			}
+
+			err := c.writer.WriteFrame(&heartbeatFrame{})
+			c.sendM.Unlock()
+			c.heartbeatM.Unlock()
+
+			if err != nil {
+				// Do not compete with an in-progress close: the reader must
+				// observe one consistent shutdown reason.
+				if c.isClosing() {
 					return
 				}
+				go c.shutdown(&Error{
+					Code:   FrameError,
+					Reason: err.Error(),
+				})
+				return
 			}
+
+			blockedSince = time.Time{}
+			c.noteFrameWrite()
+			lastSent = at
 
 		case conn := <-c.deadlines:
 			// When reading, reset our side of the deadline, if we've negotiated one with
@@ -1856,6 +1997,11 @@ func (c *Connection) resetState() {
 	// Re-apply the spec's pre-negotiation ceiling, as Open() does, so the new
 	// reader does not inherit the frame_max negotiated on the previous connection.
 	c.maxFrameSize.Store(frameMinSize)
+
+	// Frame activity belongs to the previous transport; start the new
+	// connection with no read/write commit history.
+	c.lastFrameRead.Store(0)
+	c.lastFrameWrite.Store(0)
 
 	c.errors = make(chan *Error, 1)
 	c.close = make(chan struct{})
