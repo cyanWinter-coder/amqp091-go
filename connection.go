@@ -192,12 +192,17 @@ type Connection struct {
 	m           sync.Mutex   // struct field mutex
 	notifyM     sync.RWMutex // Mutex for notifying close/block listeners; mirrors Channel.notifyM
 
-	conn io.ReadWriteCloser
+	// res is the currently published recovery generation's resources. It is
+	// swapped exactly once per successful reconnect (see commit), so
+	// concurrent sends, RPCs, and notifications only ever observe one current
+	// connection. Hot-path readers load it lock-free.
+	res atomic.Pointer[connResources]
 
-	rpc       chan message
-	writer    *writer
-	sends     chan time.Time     // timestamps of each frame sent
-	deadlines chan readDeadliner // heartbeater updates read deadlines
+	// lastGen numbers recovery generations. Every connection establishment —
+	// the initial Open and each reconnect candidate — takes the next number,
+	// so a frame, RPC, or teardown can always be attributed to exactly one
+	// generation.
+	lastGen atomic.Uint64
 
 	allocator *allocator // id generator valid after openTune
 	channels  map[uint16]*Channel
@@ -208,10 +213,6 @@ type Connection struct {
 	noNotify bool // true when we will never notify again
 	closes   []chan *Error
 	blocks   []chan Blocking
-
-	errors chan *Error
-	// if connection is closed should close this chan
-	close chan struct{}
 
 	Config Config // The negotiated Config after connection.open
 
@@ -245,6 +246,60 @@ type Connection struct {
 
 type readDeadliner interface {
 	SetReadDeadline(time.Time) error
+}
+
+// connResources bundles everything that belongs to a single recovery
+// generation of the underlying transport: the socket, its frame writer, and
+// the channels that this generation's reader/heartbeater goroutines and
+// in-flight RPCs synchronize on. A generation's resources always resolve
+// together: once a generation is superseded or torn down, its reader, RPCs,
+// and sends can only reach this generation's terminal state, never a later
+// generation's.
+type connResources struct {
+	conn      io.ReadWriteCloser
+	writer    *writer
+	rpc       chan message
+	errors    chan *Error
+	close     chan struct{}      // closed to stop this generation's reader/heartbeater
+	sends     chan time.Time     // timestamps of each frame sent
+	deadlines chan readDeadliner // heartbeater updates read deadlines
+
+	gen uint64 // recovery generation number, from Connection.lastGen
+
+	teardownOnce sync.Once
+}
+
+func newConnResources(conn io.ReadWriteCloser, gen uint64) *connResources {
+	return &connResources{
+		conn:      conn,
+		writer:    &writer{bufio.NewWriter(conn)},
+		rpc:       make(chan message),
+		errors:    make(chan *Error, 1),
+		close:     make(chan struct{}),
+		sends:     make(chan time.Time),
+		deadlines: make(chan readDeadliner, 1),
+		gen:       gen,
+	}
+}
+
+// teardown releases exactly this generation's resources: it fails any RPC
+// still waiting on this generation, stops its reader and heartbeater, and
+// closes the socket. It is idempotent and safe to call on a superseded or
+// never-committed (candidate) generation.
+func (r *connResources) teardown(err *Error) {
+	r.teardownOnce.Do(func() {
+		if err != nil {
+			select {
+			case r.errors <- err:
+			default:
+			}
+		}
+		close(r.errors)
+		if r.conn != nil {
+			r.conn.Close()
+		}
+		close(r.close)
+	})
 }
 
 // DefaultDial establishes a connection when config.Dial is not provided
@@ -440,24 +495,20 @@ to use your own custom transport.
 */
 func Open(conn io.ReadWriteCloser, config Config) (*Connection, error) {
 	c := &Connection{
-		conn:                  conn,
-		writer:                &writer{bufio.NewWriter(conn)},
 		channels:              make(map[uint16]*Channel),
 		topologyConfiguration: make(map[uint16]*TopologyConfiguration),
-		rpc:                   make(chan message),
-		sends:                 make(chan time.Time),
-		errors:                make(chan *Error, 1),
-		close:                 make(chan struct{}),
-		deadlines:             make(chan readDeadliner, 1),
 		// TODO: Connection has Config and also an atomic int for MaxFrameSize. Duplication to simplify.
 		Config:    config,
 		lifeCycle: newLifeCycle(),
 	}
+	// The initial connection establishment is recovery generation 1.
+	res := newConnResources(conn, c.lastGen.Add(1))
+	c.res.Store(res)
 	// Before max frame size is negotiated in Tune, the spec sets a ceiling of 4096 bytes
 	c.maxFrameSize.Store(frameMinSize)
 	c.originalSASL = cloneAuthentications(config.SASL)
-	go c.reader(conn)
-	err := c.open(config)
+	go c.reader(res)
+	err := c.open(res, config)
 	if err == nil {
 		c.lifeCycle.SetState(StateOpen, nil)
 	}
@@ -485,10 +536,12 @@ LocalAddr returns the local TCP peer address, or ":0" (the zero value of net.TCP
 as a fallback default value if the underlying transport does not support LocalAddr().
 */
 func (c *Connection) LocalAddr() net.Addr {
-	if conn, ok := c.conn.(interface {
-		LocalAddr() net.Addr
-	}); ok {
-		return conn.LocalAddr()
+	if res := c.res.Load(); res != nil {
+		if conn, ok := res.conn.(interface {
+			LocalAddr() net.Addr
+		}); ok {
+			return conn.LocalAddr()
+		}
 	}
 	return &net.TCPAddr{}
 }
@@ -497,10 +550,12 @@ func (c *Connection) LocalAddr() net.Addr {
 RemoteAddr returns the remote TCP peer address, if known.
 */
 func (c *Connection) RemoteAddr() net.Addr {
-	if conn, ok := c.conn.(interface {
-		RemoteAddr() net.Addr
-	}); ok {
-		return conn.RemoteAddr()
+	if res := c.res.Load(); res != nil {
+		if conn, ok := res.conn.(interface {
+			RemoteAddr() net.Addr
+		}); ok {
+			return conn.RemoteAddr()
+		}
 	}
 	return &net.TCPAddr{}
 }
@@ -509,10 +564,12 @@ func (c *Connection) RemoteAddr() net.Addr {
 // Returns a zero value when the underlying connection does not implement
 // ConnectionState() tls.ConnectionState.
 func (c *Connection) ConnectionState() tls.ConnectionState {
-	if conn, ok := c.conn.(interface {
-		ConnectionState() tls.ConnectionState
-	}); ok {
-		return conn.ConnectionState()
+	if res := c.res.Load(); res != nil {
+		if conn, ok := res.conn.(interface {
+			ConnectionState() tls.ConnectionState
+		}); ok {
+			return conn.ConnectionState()
+		}
 	}
 	return tls.ConnectionState{}
 }
@@ -750,7 +807,11 @@ func (c *Connection) IsClosed() bool {
 // net.Conn.SetDeadline(). It returns an error, in case the type assertion fails,
 // although this should never happen.
 func (c *Connection) setDeadline(t time.Time) error {
-	con, ok := c.conn.(net.Conn)
+	res := c.res.Load()
+	if res == nil {
+		return errInvalidTypeAssertion
+	}
+	con, ok := res.conn.(net.Conn)
 	if !ok {
 		return errInvalidTypeAssertion
 	}
@@ -762,22 +823,35 @@ func (c *Connection) send(f frame) error {
 		return ErrClosed
 	}
 
+	res := c.res.Load()
+	if res == nil {
+		return ErrClosed
+	}
+	return c.sendOn(res, f)
+}
+
+// sendOn writes a frame to a specific connection generation. Unlike send it
+// performs no IsClosed check: the AMQP handshake runs on a candidate
+// generation while the connection is still (correctly) marked closed, and
+// generation-scoped teardown makes writes to a dead generation fail on their
+// own.
+func (c *Connection) sendOn(res *connResources, f frame) error {
 	c.sendM.Lock()
-	err := c.writer.WriteFrame(f)
+	err := res.writer.WriteFrame(f)
 	c.sendM.Unlock()
 
 	if err != nil {
 		// shutdown could be re-entrant from signaling notify chans
-		go c.shutdown(&Error{
+		go c.shutdownGen(&Error{
 			Code:   FrameError,
 			Reason: err.Error(),
-		})
+		}, res)
 	} else {
 		// Broadcast we sent a frame, reducing heartbeats, only
 		// if there is something that can receive - like a non-reentrant
 		// call or if the heartbeater isn't running
 		select {
-		case c.sends <- time.Now():
+		case res.sends <- time.Now():
 		default:
 		}
 	}
@@ -813,16 +887,21 @@ func (c *Connection) sendUnflushed(f frame) error {
 		return ErrClosed
 	}
 
+	res := c.res.Load()
+	if res == nil {
+		return ErrClosed
+	}
+
 	c.sendM.Lock()
-	err := c.writer.WriteFrameNoFlush(f)
+	err := res.writer.WriteFrameNoFlush(f)
 	c.sendM.Unlock()
 
 	if err != nil {
 		// shutdown could be re-entrant from signaling notify chans
-		go c.shutdown(&Error{
+		go c.shutdownGen(&Error{
 			Code:   FrameError,
 			Reason: err.Error(),
-		})
+		}, res)
 	}
 
 	return err
@@ -831,7 +910,11 @@ func (c *Connection) sendUnflushed(f frame) error {
 // This method is intended to be used with sendUnflushed() to explicitly flush
 // the buffer after all required Frames have been written to the buffer.
 func (c *Connection) flush() (err error) {
-	if buf, ok := c.writer.w.(*bufio.Writer); ok {
+	res := c.res.Load()
+	if res == nil {
+		return ErrClosed
+	}
+	if buf, ok := res.writer.w.(*bufio.Writer); ok {
 		err = buf.Flush()
 
 		// Moving send notifier to flush increases basicPublish for the small message
@@ -844,13 +927,30 @@ func (c *Connection) flush() (err error) {
 			// if there is something that can receive - like a non-reentrant
 			// call or if the heartbeater isn't running
 			select {
-			case c.sends <- time.Now():
+			case res.sends <- time.Now():
 			default:
 			}
 		}
 	}
 
 	return
+}
+
+// shutdownGen routes a teardown request to the generation that owns res. The
+// published generation gets a full connection shutdown; a superseded or
+// never-committed (candidate) generation only releases its own resources and
+// leaves the published connection state untouched. This is what keeps a
+// late-dying reader or send from a previous generation from tearing down the
+// connection that replaced it.
+func (c *Connection) shutdownGen(err *Error, res *connResources) {
+	if res == nil {
+		return
+	}
+	if c.res.Load() == res {
+		c.shutdown(err)
+		return
+	}
+	res.teardown(err)
 }
 
 func (c *Connection) shutdown(err *Error) {
@@ -890,15 +990,13 @@ func (c *Connection) shutdown(err *Error) {
 				}(listener, err)
 			}
 		}
-
-		select {
-		case c.errors <- err:
-		default:
-		}
 	}
 
-	// Shutdown handler goroutine can still receive the result.
-	close(c.errors)
+	// Release this generation's resources: fail in-flight RPCs, stop the
+	// reader and heartbeater, and close the socket.
+	if res := c.res.Load(); res != nil {
+		res.teardown(err)
+	}
 
 	// Shutdown the channel, but do not use closeChannel() as it calls
 	// releaseChannel() which requires the connection lock.
@@ -908,10 +1006,6 @@ func (c *Connection) shutdown(err *Error) {
 	for _, ch := range c.channels {
 		ch.shutdown(err)
 	}
-
-	c.conn.Close()
-	// reader exit
-	close(c.close)
 
 	if err == nil || !c.IsRecoveryEnabled() {
 		var e error
@@ -924,56 +1018,76 @@ func (c *Connection) shutdown(err *Error) {
 
 // All methods sent to the connection channel should be synchronous so we
 // can handle them directly without a framing component
-func (c *Connection) demux(f frame) {
+func (c *Connection) demux(res *connResources, f frame) {
 	if f.channel() == 0 {
-		c.dispatch0(f)
-	} else {
-		c.dispatchN(f)
+		c.dispatch0(res, f)
+		return
 	}
+	// Channel frames are only dispatched for the published generation. A
+	// superseded reader (or a not-yet-committed candidate) must never feed
+	// frames into channel state that belongs to a different generation.
+	if c.res.Load() != res {
+		Logger.Printf("[debug] dropping frame for channel %d from connection generation %d: not the current generation", f.channel(), res.gen)
+		return
+	}
+	c.dispatchN(res, f)
 }
 
-func (c *Connection) dispatch0(f frame) {
+func (c *Connection) dispatch0(res *connResources, f frame) {
 	switch mf := f.(type) {
 	case *methodFrame:
 		switch m := mf.Method.(type) {
 		case *connectionClose:
 			// Send immediately as shutdown will close our side of the writer.
 			f := &methodFrame{ChannelId: 0, Method: &connectionCloseOk{}}
-			if err := c.send(f); err != nil {
+			if err := c.sendOn(res, f); err != nil {
 				Logger.Printf("error sending connectionCloseOk, error: %+v", err)
 			}
-			c.shutdown(newError(m.ReplyCode, m.ReplyText))
+			c.shutdownGen(newError(m.ReplyCode, m.ReplyText), res)
 		case *connectionBlocked:
-			c.m.Lock()
-			blocks := c.blocks
-			c.m.Unlock()
-			notifyAll(blocks, Blocking{Active: true, Reason: m.Reason})
+			c.notifyBlocked(res, Blocking{Active: true, Reason: m.Reason})
 		case *connectionUnblocked:
-			c.m.Lock()
-			blocks := c.blocks
-			c.m.Unlock()
-			notifyAll(blocks, Blocking{Active: false})
+			c.notifyBlocked(res, Blocking{Active: false})
 		default:
 			select {
-			case <-c.close:
+			case <-res.close:
 				return
-			case c.rpc <- m:
+			case res.rpc <- m:
 			}
 		}
 	case *heartbeatFrame:
 		// kthx - all reads reset our deadline.  so we can drop this
 	default:
 		// lolwat - channel0 only responds to methods and heartbeats
-		// closeWith use call don't block reader
-		go func() {
-			if err := c.closeWith(ErrUnexpectedFrame); err != nil {
-				Logger.Printf("error sending connectionCloseOk with ErrUnexpectedFrame, error: %+v", err)
-			}
-		}()
+		if c.res.Load() == res {
+			// closeWith use call don't block reader
+			go func() {
+				if err := c.closeWith(ErrUnexpectedFrame); err != nil {
+					Logger.Printf("error sending connectionCloseOk with ErrUnexpectedFrame, error: %+v", err)
+				}
+			}()
+		} else {
+			// A candidate generation has no published connection to close;
+			// fail its handshake instead.
+			res.teardown(ErrUnexpectedFrame)
+		}
 	}
 }
 
-func (c *Connection) dispatchN(f frame) {
+// notifyBlocked broadcasts a connection.blocked/unblocked notification, but
+// only for the published generation: flow-control state of a candidate or
+// superseded generation is not caller-visible.
+func (c *Connection) notifyBlocked(res *connResources, b Blocking) {
+	if c.res.Load() != res {
+		return
+	}
+	c.m.Lock()
+	blocks := c.blocks
+	c.m.Unlock()
+	notifyAll(blocks, b)
+}
+
+func (c *Connection) dispatchN(res *connResources, f frame) {
 	c.m.Lock()
 	channel, ok := c.channels[f.channel()]
 	if ok {
@@ -988,7 +1102,7 @@ func (c *Connection) dispatchN(f frame) {
 	if ok {
 		channel.recv(channel, f)
 	} else {
-		c.dispatchClosed(f)
+		c.dispatchClosed(res, f)
 	}
 }
 
@@ -1003,13 +1117,13 @@ func (c *Connection) dispatchN(f frame) {
 // method like basic.publish and a synchronous close with channel.close.
 // In that case, we'll get both a channel.close and channel.close-ok in any
 // order.
-func (c *Connection) dispatchClosed(f frame) {
+func (c *Connection) dispatchClosed(res *connResources, f frame) {
 	// Only consider method frames, drop content/header frames
 	if mf, ok := f.(*methodFrame); ok {
 		switch mf.Method.(type) {
 		case *channelClose:
 			f := &methodFrame{ChannelId: f.channel(), Method: &channelCloseOk{}}
-			if err := c.send(f); err != nil {
+			if err := c.sendOn(res, f); err != nil {
 				Logger.Printf("error sending channelCloseOk, channel id: %d error: %+v", f.channel(), err)
 			}
 		case *channelCloseOk:
@@ -1028,28 +1142,30 @@ func (c *Connection) dispatchClosed(f frame) {
 
 // Reads each frame off the IO and hand off to the connection object that
 // will demux the streams and dispatch to one of the opened channels or
-// handle on channel 0 (the connection channel).
-func (c *Connection) reader(r io.Reader) {
-	buf := bufio.NewReader(r)
+// handle on channel 0 (the connection channel). The reader is pinned to its
+// generation's resources: it exits when that generation's socket is closed
+// and can never observe or disturb a later generation.
+func (c *Connection) reader(res *connResources) {
+	buf := bufio.NewReader(res.conn)
 	frames := &reader{r: buf, maxFrameSize: &c.maxFrameSize}
-	conn, haveDeadliner := r.(readDeadliner)
+	conn, haveDeadliner := res.conn.(readDeadliner)
 
-	defer close(c.rpc)
+	defer close(res.rpc)
 
 	for {
 		frame, err := frames.ReadFrame()
 		if err != nil {
-			c.shutdown(&Error{Code: FrameError, Reason: err.Error()})
+			c.shutdownGen(&Error{Code: FrameError, Reason: err.Error()}, res)
 			return
 		}
 
-		c.demux(frame)
+		c.demux(res, frame)
 
 		if haveDeadliner {
 			select {
-			case c.deadlines <- conn:
+			case res.deadlines <- conn:
 			default:
-				// On c.Close() c.heartbeater() might exit just before c.deadlines <- conn is called.
+				// On c.Close() c.heartbeater() might exit just before res.deadlines <- conn is called.
 				// Which results in this goroutine being stuck forever.
 			}
 		}
@@ -1057,8 +1173,9 @@ func (c *Connection) reader(r io.Reader) {
 }
 
 // Ensures that at least one frame is being sent at the tuned interval with a
-// jitter tolerance of 1s
-func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
+// jitter tolerance of 1s. The heartbeater is pinned to its generation's
+// resources and exits when that generation is torn down.
+func (c *Connection) heartbeater(res *connResources, interval time.Duration) {
 	const maxServerHeartbeatsInFlight = 3
 
 	var sendTicks <-chan time.Time
@@ -1072,7 +1189,7 @@ func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
 
 	for {
 		select {
-		case at, stillSending := <-c.sends:
+		case at, stillSending := <-res.sends:
 			// When actively sending, depend on sent frames to reset server timer
 			if stillSending {
 				lastSent = at
@@ -1083,14 +1200,14 @@ func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
 		case at := <-sendTicks:
 			// When idle, fill the space with a heartbeat frame
 			if at.Sub(lastSent) > interval-time.Second {
-				if err := c.send(&heartbeatFrame{}); err != nil {
+				if err := c.sendOn(res, &heartbeatFrame{}); err != nil {
 					// send heartbeats even after close/closeOk so we
 					// tick until the connection starts erroring
 					return
 				}
 			}
 
-		case conn := <-c.deadlines:
+		case conn := <-res.deadlines:
 			// When reading, reset our side of the deadline, if we've negotiated one with
 			// a deadline that covers at least 2 server heartbeats
 			if interval > 0 {
@@ -1103,7 +1220,7 @@ func (c *Connection) heartbeater(interval time.Duration, done chan struct{}) {
 				}
 			}
 
-		case <-done:
+		case <-res.close:
 			return
 		}
 	}
@@ -1218,34 +1335,42 @@ func (c *Connection) Channel() (*Channel, error) {
 }
 
 func (c *Connection) call(req message, res ...message) error {
+	r := c.res.Load()
+	if r == nil {
+		return ErrClosed
+	}
+	return c.callOn(r, req, res...)
+}
+
+// callOn performs a synchronous request/response against a specific
+// connection generation. The RPC is pinned to that generation: if the
+// generation is torn down (or was never committed), the call resolves with
+// the generation's terminal error instead of leaking into the next
+// generation's RPC channels.
+func (c *Connection) callOn(r *connResources, req message, res ...message) error {
 	// Special case for when the protocol header frame is sent instead of a
 	// request method
 	if req != nil {
-		if err := c.send(&methodFrame{ChannelId: 0, Method: req}); err != nil {
+		if err := c.sendOn(r, &methodFrame{ChannelId: 0, Method: req}); err != nil {
 			return err
 		}
 	}
 
-	c.m.Lock()
-	errors := c.errors
-	rpc := c.rpc
-	c.m.Unlock()
-
 	var msg message
 	select {
-	case e, ok := <-errors:
+	case e, ok := <-r.errors:
 		if ok {
 			return e
 		}
 		return ErrClosed
-	case m, ok := <-rpc:
+	case m, ok := <-r.rpc:
 		if !ok {
 			// The reader has exited, so shutdown already ran and left its reason
 			// (if any) buffered in errors. When both channels are ready select
 			// may pick this one; report the shutdown reason rather than
 			// mistaking the nil message for an unexpected command.
 			select {
-			case e, ok := <-errors:
+			case e, ok := <-r.errors:
 				if ok {
 					return e
 				}
@@ -1286,18 +1411,18 @@ func (c *Connection) call(req message, res ...message) error {
 //
 //	close-Connection    = C:CLOSE S:CLOSE-OK
 //	                      S:CLOSE C:CLOSE-OK
-func (c *Connection) open(config Config) error {
-	if err := c.send(&protocolHeader{}); err != nil {
+func (c *Connection) open(res *connResources, config Config) error {
+	if err := c.sendOn(res, &protocolHeader{}); err != nil {
 		return err
 	}
 
-	return c.openStart(config)
+	return c.openStart(res, config)
 }
 
-func (c *Connection) openStart(config Config) error {
+func (c *Connection) openStart(res *connResources, config Config) error {
 	start := &connectionStart{}
 
-	if err := c.call(nil, start); err != nil {
+	if err := c.callOn(res, nil, start); err != nil {
 		return err
 	}
 
@@ -1323,10 +1448,10 @@ func (c *Connection) openStart(config Config) error {
 	// Set the connection locale to client locale
 	c.Config.Locale = config.Locale
 
-	return c.openTune(config, auth)
+	return c.openTune(res, config, auth)
 }
 
-func (c *Connection) openTune(config Config, auth Authentication) error {
+func (c *Connection) openTune(res *connResources, config Config, auth Authentication) error {
 	if len(config.Properties) == 0 {
 		config.Properties = NewConnectionProperties()
 	}
@@ -1346,7 +1471,7 @@ func (c *Connection) openTune(config Config, auth Authentication) error {
 	}
 	tune := &connectionTune{}
 
-	if err := c.call(ok, tune); err != nil {
+	if err := c.callOn(res, ok, tune); err != nil {
 		// The broker either answered start-ok with a connection.close (RabbitMQ
 		// does so when the client advertises authentication_failure_close) or,
 		// as the spec originally allowed, dropped the socket without a word.
@@ -1406,9 +1531,9 @@ func (c *Connection) openTune(config Config, auth Authentication) error {
 
 	// "The client should start sending heartbeats after receiving a
 	// Connection.Tune method"
-	go c.heartbeater(c.Config.Heartbeat/2, c.close)
+	go c.heartbeater(res, c.Config.Heartbeat/2)
 
-	if err := c.send(&methodFrame{
+	if err := c.sendOn(res, &methodFrame{
 		ChannelId: 0,
 		Method: &connectionTuneOk{
 			ChannelMax: uint16(c.Config.ChannelMax),
@@ -1419,14 +1544,14 @@ func (c *Connection) openTune(config Config, auth Authentication) error {
 		return err
 	}
 
-	return c.openVhost(config)
+	return c.openVhost(res, config)
 }
 
-func (c *Connection) openVhost(config Config) error {
+func (c *Connection) openVhost(res *connResources, config Config) error {
 	req := &connectionOpen{VirtualHost: config.Vhost}
-	res := &connectionOpenOk{}
+	openOk := &connectionOpenOk{}
 
-	if err := c.call(req, res); err != nil {
+	if err := c.callOn(res, req, openOk); err != nil {
 		// RabbitMQ rejects connection.open with a connection.close whose code and
 		// text say why: 530 NOT_ALLOWED for a vhost the user may not access or
 		// for a reached per-user or per-vhost connection limit. Surface that
@@ -1437,7 +1562,7 @@ func (c *Connection) openVhost(config Config) error {
 
 	c.Config.Vhost = config.Vhost
 
-	return c.openComplete()
+	return c.openComplete(res)
 }
 
 // Only trust err as the failure reason if the broker actually sent it;
@@ -1452,11 +1577,11 @@ func handshakeError(err error, fallback *Error) error {
 
 // openComplete performs any final Connection initialization dependent on the
 // connection handshake and clears any state needed for TLS and AMQP handshaking.
-func (c *Connection) openComplete() error {
+func (c *Connection) openComplete(res *connResources) error {
 	// We clear the deadlines and let the heartbeater reset the read deadline if requested.
 	// RabbitMQ uses TCP flow control at this point for pushback so Writes can
 	// intentionally block.
-	if deadliner, ok := c.conn.(interface {
+	if deadliner, ok := res.conn.(interface {
 		SetDeadline(time.Time) error
 	}); ok {
 		_ = deadliner.SetDeadline(time.Time{})
@@ -1639,14 +1764,21 @@ func (c *Connection) watchConnection() {
 // It performs a retry loop to dial the broker, negotiate the AMQP handshake, and recover all
 // active channels and their registered consumers sequentially.
 //
+// Each attempt builds the next recovery generation as a candidate: the socket, reader, writer,
+// and AMQP handshake are fully established off to the side and only published (committed) as the
+// connection's current generation once the handshake has completed. A failed attempt — or a
+// Close() racing the attempt — cancels the candidate and releases its socket, reader, and writer
+// without any half-initialized state ever becoming visible to callers. A committed generation
+// whose channel or topology recovery then fails is rolled back to the closed state so the next
+// attempt starts clean.
+//
 // Applications must coordinate with in-progress recovery rather than calling into the
 // Connection unconditionally: register NotifyStateChange and hold off on new connection-level
-// calls (e.g. Channel(), UpdateSecret()) until state is StateOpen again. In order to initiate
-// the AMQP handshake below, IsClosed() will momentarily return false before c.open actually
-// completes it — a connection-level call made in that window, without waiting for StateOpen,
-// can interleave a frame with the handshake and cause the broker to reject it as a protocol
-// violation. Waiting for StateOpen via NotifyStateChange before issuing new connection-level
-// calls avoids this entirely.
+// calls (e.g. Channel(), UpdateSecret()) until state is StateOpen again. IsClosed() keeps
+// reporting true until a candidate has been fully handshaken and committed, and the lifecycle
+// only reaches StateOpen once channels and topology are recovered, so waiting for StateOpen via
+// NotifyStateChange before issuing new connection-level calls avoids interleaving with recovery
+// entirely.
 func (c *Connection) Reconnect() (err error) {
 	if !c.IsRecoveryEnabled() {
 		return ErrClosed
@@ -1668,11 +1800,10 @@ func (c *Connection) Reconnect() (err error) {
 		return nil
 	}
 
-	// resetState() below flips c.closed to false mid-attempt so open() and
-	// channel recovery can send frames on the new connection. If this attempt
-	// then fails or is aborted, leaving c.closed false would let a
-	// concurrently-blocked Close() (which waits on c.reconnecting for us to
-	// settle) mistake the dead connection for a live one once we return.
+	// commit() below flips c.closed to false when it publishes a candidate.
+	// If this attempt then fails or is aborted, leaving c.closed false would
+	// let a concurrently-blocked Close() (which waits on c.reconnecting for us
+	// to settle) mistake the dead connection for a live one once we return.
 	// Guarantee the invariant here instead of at every failure/abort return
 	// site below: any non-nil return means the connection is closed. Registered
 	// only past the guard clauses above, so it can't fire for a connection
@@ -1756,45 +1887,34 @@ func (c *Connection) Reconnect() (err error) {
 			conn = client
 		}
 
-		// Reset state and swap connection under locks to ensure atomicity
-		// and prevent data races with concurrent readers/writers.
-		// Acquiring destructorM -> closeM -> m avoids any lock ordering deadlocks.
-		c.destructorM.Lock()
-		c.closeM.Lock()
-		c.m.Lock()
+		// Build the next generation as a candidate: its socket, reader,
+		// writer, and RPC channels exist only off to the side until the AMQP
+		// handshake completes and the candidate is committed. Nothing the
+		// caller can observe (IsClosed, LocalAddr, Channel, Notify*) is
+		// touched before then, so a failed attempt publishes no
+		// half-initialized state.
+		candidate := newConnResources(conn, c.lastGen.Add(1))
 
-		// Re-check closeInit: Close()/CloseDeadline()/closeWith() may have set
-		// it while we were dialing/handshaking above, before we grabbed these
-		// locks. Bail out here rather than swapping in the new connection and
-		// starting a reader for it — otherwise Phase 1 below would reject the
-		// channel reconnects anyway (IsRecoveryEnabled() is false once closeInit
-		// is set), leaving us to tear down the connection we just built for
-		// nothing: the open() handshake wasted, and the reader goroutine we just
-		// started immediately killed by closing the socket out from under it.
-		if c.closeInit {
-			c.m.Unlock()
-			c.closeM.Unlock()
-			c.destructorM.Unlock()
-			conn.Close()
-			return ErrClosed
+		// Re-apply the spec's pre-negotiation ceiling, as Open() does, so the
+		// candidate's reader does not inherit the frame_max negotiated on the
+		// previous generation.
+		c.maxFrameSize.Store(frameMinSize)
+
+		go c.reader(candidate)
+
+		if err = c.open(candidate, c.Config); err != nil {
+			Logger.Printf("Connection recovery open error: %v", err)
+			candidate.teardown(nil)
+			continue
 		}
 
-		// Swap the connection
-		c.conn = conn
-		c.writer = &writer{bufio.NewWriter(conn)}
-
-		c.resetState()
-
-		c.m.Unlock()
-		c.closeM.Unlock()
-		c.destructorM.Unlock()
-
-		go c.reader(conn)
-
-		if err = c.open(c.Config); err != nil {
-			Logger.Printf("Connection recovery open error: %v", err)
-			conn.Close()
-			continue
+		// Publish the candidate as the current generation. The commit fails
+		// when Close()/CloseDeadline() marked close-init while the candidate
+		// was being built; the candidate is then cancelled and its socket,
+		// reader, and writer released without ever becoming visible.
+		if !c.commit(candidate) {
+			candidate.teardown(nil)
+			return ErrClosed
 		}
 
 		// Reconnect channels
@@ -1809,7 +1929,6 @@ func (c *Connection) Reconnect() (err error) {
 		for _, ch := range channels {
 			if err = ch.reconnectChannel(); err != nil {
 				Logger.Printf("Connection recovery failed to reconnect channel %d: %v", ch.id, err)
-				conn.Close()
 				break
 			}
 		}
@@ -1820,12 +1939,19 @@ func (c *Connection) Reconnect() (err error) {
 			skippedTopologyEntities, err = c.Config.Recovery.TopologyRecovery.RecoverTopology(c, channels)
 			if err != nil {
 				Logger.Printf("Connection recovery failed to recover topology: %v", err)
-				conn.Close()
 			}
+		}
+
+		// A connection drop during channel/topology recovery (e.g. the broker
+		// closed the freshly committed socket) must not be reported as a
+		// successful recovery: treat it as a failed attempt and roll back.
+		if err == nil && c.IsClosed() {
+			err = ErrClosed
 		}
 
 		// This error check is for retrying when the channels are not able to reconnect
 		if err != nil {
+			c.rollbackGeneration(candidate, err)
 			continue
 		}
 
@@ -1839,29 +1965,70 @@ func (c *Connection) Reconnect() (err error) {
 	}
 
 	Logger.Printf("Connection recovery exhausted all %d retries", c.MaxRetryCount())
-	if c.conn != nil {
-		c.conn.Close()
+	// Every candidate above released its own resources on failure; this is a
+	// final idempotent safety net for the published generation.
+	if res := c.res.Load(); res != nil {
+		res.teardown(nil)
 	}
 
 	return err
 }
 
-// resetState clears the shutdown flag and re-initializes the internal channels
-// so the connection can be reused after a successful reconnection.
-// The caller must hold c.destructorM and c.m.
-func (c *Connection) resetState() {
+// commit publishes candidate as the connection's current recovery generation
+// and returns true. It returns false when Close()/CloseDeadline() marked
+// close-init while the candidate was being built; in that case nothing is
+// published and the caller must tear the candidate down.
+//
+// Acquiring destructorM -> closeM -> m avoids any lock ordering deadlocks.
+func (c *Connection) commit(candidate *connResources) bool {
+	c.destructorM.Lock()
+	defer c.destructorM.Unlock()
+	c.closeM.Lock()
+	defer c.closeM.Unlock()
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	if c.closeInit {
+		return false
+	}
+
+	// The connection reopens with this generation: clear the shutdown flags
+	// so sends and channel allocation work again.
 	c.closed.Store(false)
 	c.destructed = false
+	c.res.Store(candidate)
+	return true
+}
 
-	// Re-apply the spec's pre-negotiation ceiling, as Open() does, so the new
-	// reader does not inherit the frame_max negotiated on the previous connection.
-	c.maxFrameSize.Store(frameMinSize)
+// rollbackGeneration tears down a committed generation whose channel or
+// topology recovery failed, returning the connection to the closed state so
+// the next attempt builds a fresh candidate instead of stacking one on top of
+// a half-recovered generation. Connection-level notify listeners are
+// deliberately not notified: recovery is still in progress and the retry loop
+// owns the outcome.
+func (c *Connection) rollbackGeneration(res *connResources, err error) {
+	c.closed.Store(true)
 
-	c.errors = make(chan *Error, 1)
-	c.close = make(chan struct{})
+	c.destructorM.Lock()
+	c.destructed = true
+	c.destructorM.Unlock()
 
-	// Re-create the rpc channel so we don't read stale messages from the previous connection
-	c.rpc = make(chan message)
+	var amqpErr *Error
+	if !errors.As(err, &amqpErr) {
+		amqpErr = &Error{Code: InternalError, Reason: err.Error()}
+	}
+
+	// Shut every channel back down so the next attempt re-opens it on a live
+	// generation. Channels this attempt never reached are still destructed
+	// from the original shutdown and ignore this; channels that were
+	// re-opened on the rolled-back generation must not survive it.
+	c.m.Lock()
+	for _, ch := range c.channels {
+		ch.shutdown(amqpErr)
+	}
+	c.m.Unlock()
+
+	res.teardown(amqpErr)
 }
 
 // IsRecoveryEnabled checks if the recovery is enabled.

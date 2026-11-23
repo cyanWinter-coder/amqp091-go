@@ -5,8 +5,6 @@
 package amqp091
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -31,12 +29,14 @@ func TestConnectionBlockedDispatchDropsNotificationOnFullListener(t *testing.T) 
 	listener <- Blocking{} // pre-fill to capacity
 
 	c := &Connection{}
+	res := &connResources{}
+	c.res.Store(res)
 	c.blocks = append(c.blocks, listener)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.dispatch0(&methodFrame{Method: &connectionBlocked{Reason: "memory"}})
+		c.dispatch0(res, &methodFrame{Method: &connectionBlocked{Reason: "memory"}})
 	}()
 
 	select {
@@ -56,12 +56,14 @@ func TestConnectionUnblockedDispatchDropsNotificationOnFullListener(t *testing.T
 	listener <- Blocking{} // pre-fill to capacity
 
 	c := &Connection{}
+	res := &connResources{}
+	c.res.Store(res)
 	c.blocks = append(c.blocks, listener)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.dispatch0(&methodFrame{Method: &connectionUnblocked{}})
+		c.dispatch0(res, &methodFrame{Method: &connectionUnblocked{}})
 	}()
 
 	select {
@@ -84,7 +86,7 @@ func TestConnectionOpenCompleteZerosSASLCredentials(t *testing.T) {
 		},
 	}
 
-	err := c.openComplete()
+	err := c.openComplete(&connResources{})
 	if err != nil {
 		t.Fatalf("unexpected error from openComplete: %v", err)
 	}
@@ -458,32 +460,25 @@ type fakeAddr struct{}
 func (fakeAddr) Network() string { return "fake" }
 func (fakeAddr) String() string  { return "fake" }
 
-// TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection forces the
-// primary race Close()/Reconnect() must handle: Close() is called while
-// Reconnect() is actively rebuilding the connection — past its closeInit
-// check, mid AMQP handshake with the broker — not merely queued behind it
-// before it started. Unlike TestReconnectAbortsWhenCloseWonTheRace (which
-// covers Close() winning the race before Reconnect() begins), this drives
-// Reconnect() all the way to a successful, live connection while Close() is
-// blocked, to prove Close() doesn't race past a stale IsClosed() snapshot
-// and instead correctly tears down the connection Reconnect() rebuilt —
-// rather than returning ErrClosed early and leaking the new reader and
-// heartbeater goroutines.
-func TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection(t *testing.T) {
+// TestCloseDuringReconnectCancelsCandidate forces the primary race
+// Close()/Reconnect() must handle: Close() is called while Reconnect() is
+// actively rebuilding the connection — past its closeInit check, mid AMQP
+// handshake with the broker — not merely queued behind it before it started.
+// The candidate generation must then be cancelled at commit time: Reconnect()
+// returns ErrClosed, the candidate's socket/reader/writer are released (the
+// server observes EOF), the previously published generation is left untouched,
+// and Close() — which waited on c.reconnecting for Reconnect() to settle —
+// completes instead of tearing down a half-initialized connection.
+func TestCloseDuringReconnectCancelsCandidate(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
 	rwc, srv := newSession(t)
 	t.Cleanup(func() { _ = rwc.Close() })
 
 	conn := &Connection{
 		url:                   "amqp://guest:guest@localhost:5672/",
-		conn:                  dummyReadWriteCloser{},
-		writer:                &writer{bufio.NewWriter(&bytes.Buffer{})},
 		channels:              make(map[uint16]*Channel),
 		topologyConfiguration: make(map[uint16]*TopologyConfiguration),
-		rpc:                   make(chan message),
-		sends:                 make(chan time.Time, 100),
-		errors:                make(chan *Error, 1),
-		close:                 make(chan struct{}),
-		deadlines:             make(chan readDeadliner, 100),
 		lifeCycle:             newLifeCycle(),
 		Config: Config{
 			Vhost:  "/",
@@ -499,11 +494,13 @@ func TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection(t *testing.
 			},
 		},
 	}
+	conn.res.Store(newConnResources(dummyReadWriteCloser{}, conn.lastGen.Add(1)))
 	conn.lifeCycle.SetState(StateOpen, nil)
 	conn.closed.Store(true) // simulate: connection is mid-drop, not yet reconnected
 
 	handshakeStarted := make(chan struct{})
 	proceedWithHandshake := make(chan struct{})
+	candidateReleased := make(chan error, 1)
 	go func() {
 		srv.expectAMQP()
 		close(handshakeStarted)
@@ -512,10 +509,10 @@ func TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection(t *testing.
 		srv.connectionTune()
 		srv.recv(0, &connectionOpen{})
 		srv.send(0, &connectionOpenOk{})
-		// Serve the close handshake the blocked Close() call below will send
-		// once Reconnect() finishes and releases c.reconnecting.
-		srv.recv(0, &connectionClose{})
-		srv.send(0, &connectionCloseOk{})
+		// The cancelled candidate must release its socket: the server side
+		// observes EOF instead of any further frames.
+		_, err := srv.S.Read(make([]byte, 1))
+		candidateReleased <- err
 	}()
 
 	reconnectDone := make(chan error, 1)
@@ -527,9 +524,8 @@ func TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection(t *testing.
 		t.Fatal("Reconnect() never reached the AMQP handshake")
 	}
 
-	// At this point Reconnect() has already swapped in the new connection,
-	// released destructorM/closeM/m, and started the new reader goroutine —
-	// it's now blocked in c.open() waiting on the broker, but still holds
+	// At this point Reconnect() has dialed and started the candidate's reader
+	// — it's now blocked in c.open() waiting on the broker, but still holds
 	// c.reconnecting for the rest of the call.
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- conn.Close() }()
@@ -544,24 +540,36 @@ func TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection(t *testing.
 
 	select {
 	case err := <-reconnectDone:
-		if err != nil {
-			t.Fatalf("Reconnect() returned error: %v", err)
+		if err != ErrClosed {
+			t.Fatalf("Reconnect() = %v, want ErrClosed (Close() won the race, candidate must be cancelled)", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Reconnect() did not complete after the handshake was allowed to proceed")
+		t.Fatal("Reconnect() did not abort after the handshake was allowed to proceed")
 	}
 
 	select {
 	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close() returned error: %v", err)
+		if err != ErrClosed {
+			t.Fatalf("Close() = %v, want ErrClosed (the candidate was never committed)", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close() did not unblock/complete after Reconnect() released c.reconnecting")
 	}
 
+	select {
+	case err := <-candidateReleased:
+		if err != io.EOF {
+			t.Fatalf("expected EOF on the server side after candidate cancellation, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled candidate did not release its socket")
+	}
+
 	if !conn.IsClosed() {
-		t.Fatal("expected the rebuilt connection to be closed after Close() completed")
+		t.Fatal("expected the connection to remain closed after the candidate was cancelled")
+	}
+	if gen := conn.res.Load().gen; gen != 1 {
+		t.Fatalf("a cancelled candidate must not be published: current generation = %d, want 1", gen)
 	}
 }
 
@@ -575,16 +583,8 @@ func TestCloseWaitsForInFlightReconnectThenClosesRecoveredConnection(t *testing.
 // without having reconnected anything, which would skip the cleanup() that
 // DefaultConnectionRecovery.OnConnectionClose triggers on a non-nil error).
 func TestReconnectAbortsWhenCloseWonTheRace(t *testing.T) {
-	var buf bytes.Buffer
 	var dialCalled atomic.Bool
 	conn := &Connection{
-		conn:      dummyReadWriteCloser{},
-		writer:    &writer{bufio.NewWriter(&buf)},
-		rpc:       make(chan message, 2),
-		close:     make(chan struct{}),
-		errors:    make(chan *Error, 1),
-		sends:     make(chan time.Time, 100),
-		deadlines: make(chan readDeadliner, 100),
 		lifeCycle: newLifeCycle(),
 		Config: Config{
 			Recovery: &Recovery{
@@ -1731,7 +1731,7 @@ func TestFilterTransientTopologyMixedScenario(t *testing.T) {
 }
 
 // TestConnectionCallPrefersShutdownReasonOverClosedRPC guards the select in
-// Connection.call. Once the reader has exited, rpc is closed and the shutdown
+// Connection.callOn. Once the reader has exited, rpc is closed and the shutdown
 // reason sits buffered in errors, so both cases are ready and select picks one
 // at random. call must report the shutdown reason (or ErrClosed when there is
 // none) instead of ErrCommandInvalid for the nil message read from the closed
@@ -1745,22 +1745,24 @@ func TestConnectionCallPrefersShutdownReasonOverClosedRPC(t *testing.T) {
 	// Repeat enough times that select is certain to pick the closed rpc case
 	// at least once; the assertion must hold on every iteration.
 	for i := 0; i < 200; i++ {
-		c := &Connection{errors: make(chan *Error, 1), rpc: make(chan message)}
-		c.errors <- want
-		close(c.errors)
-		close(c.rpc)
+		r := &connResources{errors: make(chan *Error, 1), rpc: make(chan message)}
+		r.errors <- want
+		close(r.errors)
+		close(r.rpc)
 
-		if err := c.call(nil, &connectionOpenOk{}); err != want {
+		c := &Connection{}
+		if err := c.callOn(r, nil, &connectionOpenOk{}); err != want {
 			t.Fatalf("iteration %d: expected shutdown reason %v, got %v", i, want, err)
 		}
 	}
 
 	for i := 0; i < 200; i++ {
-		c := &Connection{errors: make(chan *Error, 1), rpc: make(chan message)}
-		close(c.errors)
-		close(c.rpc)
+		r := &connResources{errors: make(chan *Error, 1), rpc: make(chan message)}
+		close(r.errors)
+		close(r.rpc)
 
-		if err := c.call(nil, &connectionOpenOk{}); err != ErrClosed {
+		c := &Connection{}
+		if err := c.callOn(r, nil, &connectionOpenOk{}); err != ErrClosed {
 			t.Fatalf("iteration %d: expected ErrClosed, got %v", i, err)
 		}
 	}
