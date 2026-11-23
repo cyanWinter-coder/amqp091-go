@@ -47,6 +47,14 @@ asynchronous like Channel.Publish.  The error values should still be checked for
 these methods as they will indicate IO failures like when the underlying
 connection closes.
 
+A synchronous method waits for the reply that belongs to its own request, in
+the order the broker answers the channel's methods. Replies that arrive after
+their request gave up are read completely and dropped instead of being handed
+to a later call. Set [Config].RPCTimeout to bound the wait: when it elapses the
+method returns [ErrRPCTimeout] and the channel is closed, since a reply may
+still be in flight and the timed-out method may have taken effect. A reply of
+an unexpected type likewise takes the channel out of use.
+
 # Asynchronous Events
 
 Clients of this library may be interested in receiving some of the protocol

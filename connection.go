@@ -94,6 +94,16 @@ type Config struct {
 	// the server's interval.
 	Heartbeat time.Duration
 
+	// RPCTimeout bounds how long a synchronous Channel method waits for its
+	// reply (for example QueueDeclare, basic.consume-ok, or channel.close-ok).
+	// When it elapses the call returns ErrRPCTimeout and the channel is
+	// closed, because the broker may still answer the timed-out request and
+	// that reply could otherwise be matched to a later call.
+	//
+	// Zero (the default) waits indefinitely, preserving the historical
+	// behavior. A negative value is treated as zero.
+	RPCTimeout time.Duration
+
 	// TLSClientConfig specifies the client configuration of the TLS connection
 	// when establishing a tls transport.
 	// If the URL uses an amqps scheme, then an empty tls.Config with the

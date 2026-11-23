@@ -70,7 +70,7 @@ type Channel struct {
 
 	connection *Connection
 
-	rpc       chan message
+	rpc       *rpcManager
 	consumers *consumers
 
 	id uint16
@@ -78,6 +78,10 @@ type Channel struct {
 	// closed is set to true when the channel has been closed - see Channel.send()
 	closed atomic.Bool
 	close  chan struct{}
+
+	// rpcTimeout bounds how long a synchronous RPC waits for its reply.
+	// Zero preserves the historical behavior of waiting indefinitely.
+	rpcTimeout time.Duration
 
 	// true when we will never notify again
 	noNotify bool
@@ -233,7 +237,8 @@ func newChannel(c *Connection, id uint16) *Channel {
 	return &Channel{
 		connection: c,
 		id:         id,
-		rpc:        make(chan message),
+		rpc:        newRPCManager(),
+		rpcTimeout: c.Config.RPCTimeout,
 		consumers:  makeConsumers(),
 		confirms:   newConfirms(),
 		recv:       (*Channel).recvMethod,
@@ -312,6 +317,10 @@ func (ch *Channel) shutdown(e *Error) {
 	close(ch.errors)
 	close(ch.close)
 
+	// Wake any blocked RPC waiter with the shutdown reason. This happens even
+	// when ch.errors was already taken, so the reason is never lost.
+	ch.rpc.fail(e)
+
 	if e == nil || !ch.connection.IsRecoveryEnabled() {
 		var err error
 		if e != nil {
@@ -341,44 +350,110 @@ func (ch *Channel) open() error {
 // Performs a request/response call for when the message is not NoWait and is
 // specified as Synchronous.
 func (ch *Channel) call(req message, res ...message) error {
-	if err := ch.send(req); err != nil {
-		return err
+	if !req.wait() {
+		// NoWait methods expect no reply, so no waiter is queued. They still
+		// serialize with request frames so a NoWait method cannot land among a
+		// synchronous request's frame and its waiter registration.
+		ch.rpc.sendMu.Lock()
+		defer ch.rpc.sendMu.Unlock()
+		return ch.send(req)
 	}
 
-	if req.wait() {
-		ch.m.Lock()
-		errors := ch.errors
-		rpc := ch.rpc
-		ch.m.Unlock()
-
-		select {
-		case e, ok := <-errors:
-			if ok {
-				return e
-			}
-			return ErrClosed
-
-		case msg := <-rpc:
-			if msg != nil {
-				for _, try := range res {
-					if reflect.TypeOf(msg) == reflect.TypeOf(try) {
-						// *res = *msg
-						vres := reflect.ValueOf(try).Elem()
-						vmsg := reflect.ValueOf(msg).Elem()
-						vres.Set(vmsg)
-						return nil
-					}
-				}
-				return ErrCommandInvalid
-			}
-			// RPC channel has been closed without an error, likely due to a hard
-			// error on the Connection.  This indicates we have already been
-			// shutdown and if were waiting, will have returned from the errors chan.
-			return ErrClosed
+	// A poisoned channel can no longer trust its request/reply pairing, so
+	// refuse before writing another synchronous frame. A closed channel keeps
+	// its historical ErrClosed behavior, handled by send below.
+	if !ch.IsClosed() {
+		if err := ch.rpc.errIfPoisoned(); err != nil {
+			return err
 		}
 	}
 
-	return nil
+	// Register the waiter, then write the frame. A reply can arrive as soon as
+	// the frame leaves, so the waiter must already be in line; frame and
+	// registration are one ordered step, keeping queue order equal to wire
+	// order across concurrent callers.
+	rpcReq, err := ch.rpc.begin(func() error { return ch.send(req) })
+	if err != nil {
+		return err
+	}
+
+	msg, err := ch.rpc.wait(rpcReq, ch.rpcTimeout)
+	if err != nil {
+		if err == ErrRPCTimeout {
+			// Stop waiting before retiring the tombstone. The broker may still
+			// answer the timed-out request; that reply is now consumed by the
+			// tombstone and dropped. The channel must not host more traffic
+			// until it is reopened, because the caller cannot know whether
+			// the timed-out method took effect.
+			ch.rpc.poison(ErrRPCTimeout)
+			ch.closeOnRPCDisSync(ErrRPCTimeout, rpcReq)
+		}
+		return err
+	}
+
+	ch.rpc.end(rpcReq)
+
+	for _, try := range res {
+		if reflect.TypeOf(msg) == reflect.TypeOf(try) {
+			// *res = *msg
+			vres := reflect.ValueOf(try).Elem()
+			vmsg := reflect.ValueOf(msg).Elem()
+			vres.Set(vmsg)
+			return nil
+		}
+	}
+
+	// A reply of an unexpected type means the request and reply streams are
+	// out of sync; the channel cannot safely host another synchronous call.
+	ch.rpc.poison(ErrCommandInvalid)
+	ch.closeOnRPCDisSync(ErrCommandInvalid, rpcReq)
+	return ErrCommandInvalid
+}
+
+// closeOnRPCDisSync takes the channel out of reuse after its request/reply
+// pairing became unreliable. The failed request is retired, and every other
+// waiter is woken with the same reason.
+//
+// The channel is shut down but deliberately kept registered on the connection
+// until the connection closes: the broker may still have reply frames in
+// flight for it, and those frames must be read completely and dropped rather
+// than treated as frames for an unknown channel (which would close the whole
+// connection). A courtesy channel.close is sent first so the broker stops
+// delivering on it. Both steps run off the calling goroutine: shutdown can
+// block on close listeners, and this may be reached from the connection
+// reader.
+func (ch *Channel) closeOnRPCDisSync(err error, failed *rpcRequest) {
+	amqpErr, ok := err.(*Error)
+	if !ok {
+		amqpErr = &Error{Code: InternalError, Reason: err.Error()}
+	}
+
+	ch.setClosed()
+	ch.rpc.end(failed)
+
+	if ch.connection == nil {
+		ch.rpc.fail(amqpErr)
+		return
+	}
+
+	go func() {
+		// Serialize with a request frame that may be mid-write and with a
+		// concurrent publish, so the courtesy channel.close cannot land
+		// between a publish's method, header, or body frames.
+		ch.m.Lock()
+		ch.rpc.sendMu.Lock()
+		_ = ch.connection.send(&methodFrame{
+			ChannelId: ch.id,
+			Method: &channelClose{
+				ReplyCode: replySuccess,
+				ReplyText: amqpErr.Error(),
+			},
+		})
+		ch.rpc.sendMu.Unlock()
+		ch.m.Unlock()
+
+		ch.shutdown(amqpErr)
+	}()
 }
 
 func (ch *Channel) sendClosed(msg message) (err error) {
@@ -551,15 +626,13 @@ func (ch *Channel) dispatch(msg message) {
 		// deliveries are in flight and a no-wait cancel has happened
 
 	default:
-		ch.m.Lock()
-		closeCh := ch.close
-		rpc := ch.rpc
-		ch.m.Unlock()
-
-		select {
-		case <-closeCh:
-			return
-		case rpc <- msg:
+		// Route the reply only to the waiter that is next in line for the
+		// current generation. A reply with no waiter (a late reply to a
+		// timed-out request, or one from an abandoned session) is dropped;
+		// the frame itself has already been read completely, so dropping it
+		// cannot desynchronize framing.
+		if !ch.rpc.deliver(msg) {
+			Logger.Printf("channel %d: dropping unmatched RPC reply %T", ch.id, msg)
 		}
 	}
 }
@@ -2532,7 +2605,10 @@ func (ch *Channel) resetState() {
 
 	ch.errors = make(chan *Error, 1)
 	ch.close = make(chan struct{})
-	ch.rpc = make(chan message)
+
+	// Open a new RPC generation so replies from the abandoned session can
+	// never match a waiter of the new one.
+	ch.rpc.reset()
 
 	if ch.confirms != nil {
 		ch.confirms.reset()

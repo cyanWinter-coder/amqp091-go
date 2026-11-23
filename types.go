@@ -76,6 +76,12 @@ var (
 	// to this requested message type. This indicates a bug in this client.
 	ErrCommandInvalid = &Error{Code: CommandInvalid, Reason: "unexpected command received"}
 
+	// ErrRPCTimeout is returned when a synchronous channel method does not
+	// receive its reply within the configured RPC timeout. The channel is
+	// closed afterwards: the timed-out request may still be answered, so its
+	// reply can no longer be safely correlated.
+	ErrRPCTimeout = &Error{Code: InternalError, Reason: "channel rpc timed out waiting for a reply", Recover: true}
+
 	// ErrUnexpectedFrame is returned when something other than a method or
 	// heartbeat frame is delivered to the Connection, indicating a bug in the
 	// client.
